@@ -748,6 +748,85 @@ export namespace Provider {
         },
       }
     },
+    lmstudio: async (input) => {
+      const baseURL = iife(() => {
+        if (typeof input?.options?.baseURL === "string" && input.options.baseURL) return input.options.baseURL
+        if (Env.get("LMSTUDIO_BASE_URL")) return Env.get("LMSTUDIO_BASE_URL")!
+        const host =
+          (typeof input?.options?.host === "string" ? input.options.host : undefined) ??
+          Env.get("LMSTUDIO_HOST") ??
+          "localhost"
+        const port =
+          (typeof input?.options?.port === "string" || typeof input?.options?.port === "number"
+            ? String(input.options.port)
+            : undefined) ??
+          Env.get("LMSTUDIO_PORT") ??
+          "1234"
+        return `http://${host}:${port}/v1`
+      })
+
+      const apiKey = await iife(async () => {
+        const env = Env.get("LMSTUDIO_API_KEY")
+        if (env) return env
+        const auth = await Auth.get(input.id)
+        if (auth?.type === "api") return auth.key
+        return undefined
+      })
+
+      const headers: Record<string, string> = apiKey ? { Authorization: `Bearer ${apiKey}` } : {}
+
+      const running = await fetch(`${baseURL}/models`, {
+        signal: AbortSignal.timeout(2000),
+        headers,
+      })
+        .then((r) => r.ok)
+        .catch(() => false)
+
+      if (!running) return { autoload: false }
+
+      return {
+        autoload: true,
+        options: { baseURL, apiKey: apiKey ?? "lm-studio" },
+        async discoverModels(): Promise<Record<string, Model>> {
+          try {
+            const res = await fetch(`${baseURL}/models`, {
+              signal: AbortSignal.timeout(5000),
+              headers,
+            })
+            const json = (await res.json()) as { data?: { id: string }[] }
+            const models: Record<string, Model> = {}
+            for (const m of json.data ?? []) {
+              models[m.id] = {
+                id: ModelID.make(m.id),
+                providerID: ProviderID.make("lmstudio"),
+                name: m.id,
+                api: { id: m.id, url: baseURL, npm: "@ai-sdk/openai-compatible" },
+                status: "active",
+                headers: {},
+                options: {},
+                cost: { input: 0, output: 0, cache: { read: 0, write: 0 } },
+                limit: { context: 0, output: 0 },
+                capabilities: {
+                  temperature: true,
+                  reasoning: false,
+                  attachment: false,
+                  toolcall: true,
+                  input: { text: true, audio: false, image: false, video: false, pdf: false },
+                  output: { text: true, audio: false, image: false, video: false, pdf: false },
+                  interleaved: false,
+                },
+                release_date: "",
+                variants: {},
+              }
+            }
+            return models
+          } catch (e) {
+            log.warn("lmstudio model discovery failed", { error: e })
+            return {}
+          }
+        },
+      }
+    },
   }
 
   export const Model = z
@@ -1084,6 +1163,18 @@ export namespace Provider {
       }
     }
 
+    // Ensure local providers that may not be in models.dev can still be auto-detected
+    if (!database["lmstudio"]) {
+      database["lmstudio"] = {
+        id: ProviderID.make("lmstudio"),
+        name: "LM Studio",
+        env: ["LMSTUDIO_API_KEY"],
+        options: {},
+        source: "custom",
+        models: {},
+      }
+    }
+
     for (const [id, fn] of Object.entries(CUSTOM_LOADERS)) {
       const providerID = ProviderID.make(id)
       if (disabled.has(providerID)) continue
@@ -1096,10 +1187,23 @@ export namespace Provider {
       if (result && (result.autoload || providers[providerID])) {
         if (result.getModel) modelLoaders[providerID] = result.getModel
         if (result.vars) varsLoaders[providerID] = result.vars
-        if (result.discoverModels) discoveryLoaders[providerID] = result.discoverModels
         const opts = result.options ?? {}
         const patch: Partial<Info> = providers[providerID] ? { options: opts } : { source: "custom", options: opts }
         mergeProvider(providerID, patch)
+
+        // For providers with no static models (e.g. lmstudio), discover models immediately
+        // so they pass the model-count check that runs later in the state loop
+        if (result.discoverModels && providers[providerID] && Object.keys(providers[providerID].models).length === 0) {
+          const discovered = await result.discoverModels().catch((e) => {
+            log.warn("model discovery failed", { id, error: e })
+            return {} as Record<string, Model>
+          })
+          for (const [modelID, model] of Object.entries(discovered)) {
+            providers[providerID].models[modelID] = model
+          }
+        } else if (result.discoverModels) {
+          discoveryLoaders[providerID] = result.discoverModels
+        }
       }
     }
 
@@ -1158,16 +1262,17 @@ export namespace Provider {
       log.info("found", { providerID })
     }
 
-    const gitlab = ProviderID.make("gitlab")
-    if (discoveryLoaders[gitlab] && providers[gitlab]) {
+    for (const [id, discover] of Object.entries(discoveryLoaders)) {
+      const providerID = ProviderID.make(id)
+      if (!providers[providerID]) continue
       await (async () => {
-        const discovered = await discoveryLoaders[gitlab]()
+        const discovered = await discover()
         for (const [modelID, model] of Object.entries(discovered)) {
-          if (!providers[gitlab].models[modelID]) {
-            providers[gitlab].models[modelID] = model
+          if (!providers[providerID].models[modelID]) {
+            providers[providerID].models[modelID] = model
           }
         }
-      })().catch((e) => log.warn("state discovery error", { id: "gitlab", error: e }))
+      })().catch((e) => log.warn("state discovery error", { id, error: e }))
     }
 
     return {
