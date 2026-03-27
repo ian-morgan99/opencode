@@ -766,6 +766,9 @@ export namespace Provider {
       })
 
       const apiKey = await iife(async () => {
+        const configKey =
+          typeof input?.options?.apiKey === "string" && input.options.apiKey ? input.options.apiKey : undefined
+        if (configKey) return configKey
         const env = Env.get("LMSTUDIO_API_KEY")
         if (env) return env
         const auth = await Auth.get(input.id)
@@ -1192,17 +1195,20 @@ export namespace Provider {
         mergeProvider(providerID, patch)
 
         // For providers with no static models (e.g. lmstudio), discover models immediately
-        // so they pass the model-count check that runs later in the state loop
-        if (result.discoverModels && providers[providerID] && Object.keys(providers[providerID].models).length === 0) {
-          const discovered = await result.discoverModels().catch((e) => {
-            log.warn("model discovery failed", { id, error: e })
-            return {} as Record<string, Model>
-          })
-          for (const [modelID, model] of Object.entries(discovered)) {
-            providers[providerID].models[modelID] = model
+        // so they pass the model-count check that runs later in the state loop.
+        // Only do this for allowed providers to avoid unnecessary network calls at startup.
+        if (result.discoverModels) {
+          if (isProviderAllowed(providerID) && providers[providerID] && Object.keys(providers[providerID].models).length === 0) {
+            const discovered = await result.discoverModels().catch((e) => {
+              log.warn("model discovery failed", { id, error: e })
+              return {} as Record<string, Model>
+            })
+            for (const [modelID, model] of Object.entries(discovered)) {
+              providers[providerID].models[modelID] = model
+            }
+          } else {
+            discoveryLoaders[providerID] = result.discoverModels
           }
-        } else if (result.discoverModels) {
-          discoveryLoaders[providerID] = result.discoverModels
         }
       }
     }
